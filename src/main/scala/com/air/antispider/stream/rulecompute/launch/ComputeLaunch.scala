@@ -1,23 +1,29 @@
 package com.air.antispider.stream.rulecompute.launch
 
 
+import java.text.SimpleDateFormat
+
 import com.air.antispider.stream.common.bean.ProcessedData
+import com.air.antispider.stream.common.util.hdfs.BlackListToRedis
 import com.air.antispider.stream.common.util.jedis.{JedisConnectionUtil, PropertiesUtil}
 import com.air.antispider.stream.common.util.kafka.KafkaOffsetUtil
 import com.air.antispider.stream.common.util.log4j.LoggerLevels
 import com.air.antispider.stream.dataprocess.businessprocess.AnalyzeRuleDB
-import com.air.antispider.stream.rulecompute.businessprocess.BroadcastProcess
+import com.air.antispider.stream.rulecompute.businessprocess.{BroadcastProcess, FlowScoreResult}
 import kafka.message.MessageAndMetadata
 import kafka.serializer.StringDecoder
 import org.I0Itec.zkclient.ZkClient
 import org.apache.commons.codec.StringDecoder
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.serialization.StringDeserializer
-import org.apache.spark.sql.SQLContext
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{Row, SQLContext}
 import org.apache.spark.streaming.dstream.{DStream, InputDStream}
 import org.apache.spark.streaming.kafka010.{ConsumerStrategies, KafkaUtils, LocationStrategies}
 import org.apache.spark.streaming.{Minutes, Seconds, StreamingContext}
 import org.apache.spark.{SparkConf, SparkContext}
+
+import scala.collection.mutable.ArrayBuffer
 
 /**
   * 实时统计主类
@@ -139,12 +145,11 @@ object ComputeLaunch {
       ipBlockAccessCountsMap = rdd.collectAsMap()
     }
     //测试
-//    println("测试")
 //    ipBlock.foreachRDD{ x =>x.foreach(println)}
     val ip = CoreRule.ipAccessCounts(structuredDataLines, Minutes(5), Seconds(30))
     var ipAccessCountsMap = collection.Map[String, Int]()
-    ip.foreachRDD { ipRdd =>
-      ipAccessCountsMap = ipRdd.collectAsMap()
+    ip.foreachRDD { r =>
+      ipAccessCountsMap = r.collectAsMap()
     }
     val criticalPages = CoreRule.criticalPagesCounts(structuredDataLines, Minutes(5), Seconds(30), broadcastQueryCriticalPages.value)
 
@@ -164,7 +169,7 @@ object ComputeLaunch {
       userAgentCountsMap = userAgentRdd.collectAsMap()
     }
     //测试
-    userAgent.foreachRDD(x => x.foreach(println))
+//    userAgent.foreachRDD(x => x.foreach(println))
 
     val criticalPagesAccTime = CoreRule.criticalPagesAccTime(structuredDataLines, Seconds(30), Seconds(30), broadcastQueryCriticalPages.value)
     var criticalMinIntervalMap = scala.collection.Map[String, Int]()
@@ -179,7 +184,7 @@ object ComputeLaunch {
       criticalMinIntervalMap = critivalMinIntervalRdd.collectAsMap()
     }
     //测试
-    criticalPagesAccTime.foreachRDD(x => x.foreach(println))
+//    criticalPagesAccTime.foreachRDD(x => x.foreach(println))
 
     val aCriticalPagesAccTime = CoreRule.aCriticalPagesAccTime(
       structuredDataLines, Seconds(9), Seconds(3), broadcastQueryCriticalPages.value)
@@ -192,7 +197,7 @@ object ComputeLaunch {
       acriticalPagesTimeMap = rdd.collectAsMap()
     })
     //测试
-    aCriticalPagesAccTime.foreachRDD(x => x.foreach(println))
+//    aCriticalPagesAccTime.foreachRDD(x => x.foreach(println))
 
     val flightQuery = CoreRule.flightQuerys(structuredDataLines, Minutes(5), Seconds(30))
     //统计一个IP下查询不同行程的次数
@@ -206,7 +211,7 @@ object ComputeLaunch {
       println(differentTripQuerysMap)
     }
     //测试
-    flightQuery.foreachRDD(x => x.foreach(println))
+//    flightQuery.foreachRDD(x => x.foreach(println))
 
     val criticalCookie = CoreRule.criticalCookies(structuredDataLines, Minutes(5), Seconds(30), broadcastQueryCriticalPages.value)
     //统计一个IP下不同Cookie数
@@ -216,11 +221,9 @@ object ComputeLaunch {
       (record._1, RuleUtil.cookiesCounts(cookies))
     }.foreachRDD { rdd =>
       criticalCookiesMap = rdd.collectAsMap()
-      //测试
-      println(criticalCookiesMap)
     }
     //测试
-    criticalCookie.foreachRDD(x => x.foreach(println))
+//    criticalCookie.foreachRDD(x => x.foreach(println))
 
     val antiCalculateResults = structuredDataLines.map { processedData =>
       //获取ip和request，从而可以从上面的计算结果Map中得到这条记录对应的5分钟内总量，从而匹配数据库流程规则
@@ -229,11 +232,77 @@ object ComputeLaunch {
       //反爬虫结果
       val antiCalculateResult = RuleUtil.calculateAntiResult(processedData, broadcastFlowList.value.toArray, ip, request,
         ipBlockAccessCountsMap, ipAccessCountsMap, criticalPagesCountsMap, userAgentCountsMap,
-        criticalMinIntervalMap, accessIntervalLessThanDefaultMap, differentTripQuerysMap,
+        criticalMinIntervalMap, acriticalPagesTimeMap, differentTripQuerysMap,
         criticalCookiesMap)
       antiCalculateResult
     }
 
-    ssc
+    val antiBlackResults = antiCalculateResults.filter { antiCalculateResult =>
+      val upLimitedFlows = antiCalculateResult.flowsScore.filter { flowScore =>
+        //阈值判断结果，打分值大于阈值，为true
+        flowScore.isUpLimited
+      }
+      //数据非空，说明存在大于阈值的流程打分
+      upLimitedFlows.nonEmpty
+    }
+
+    antiBlackResults.map { antiBlackResult =>(antiBlackResult.ip, antiBlackResult.flowsScore)
+    }.foreachRDD { rdd =>
+      //过滤掉重复的数据，（ip，流程分数）
+      val distincted: RDD[(String, Array[FlowScoreResult])] = rdd.reduceByKey((x, y) => x)
+      //反爬虫黑名单数据（ip，流程分数）
+      val antiBlackList: Array[(String, Array[FlowScoreResult])] = distincted.collect()
+    }
+    antiBlackResults.map { antiBlackResult =>
+      //黑名单ip，黑名单打分
+      (antiBlackResult.ip, antiBlackResult.flowsScore)
+    }.foreachRDD { rdd =>
+      //过滤掉重复的数据，（ip，流程分数）
+      val distincted: RDD[(String, Array[FlowScoreResult])] = rdd.reduceByKey((x, y) => x)
+      //反爬虫黑名单数据（ip，流程分数）
+      val antiBlackList: Array[(String, Array[FlowScoreResult])] = distincted.collect()
+      if (antiBlackList.nonEmpty) {
+        //黑名单DataFrame-备份到HDFS
+        val antiBlackListDFR = new ArrayBuffer[Row]
+        try {
+          //创建jedis连接
+          val jedis = JedisConnectionUtil.getJedisCluster
+          /*
+            *恢复redis黑名单数据，用于防止程序停止而产生的redis数据丢失
+           */
+          BlackListToRedis.blackListDataToRedis(jedis, sc, sqlContext)
+          antiBlackList.foreach { antiBlackRecord =>
+            //拿到某个反爬虫数据的打分信息 Array[FlowScoreResult])
+            antiBlackRecord._2.foreach { antiBlackRecordByFlow =>
+              //Redis基于key:field - value的方式保存黑名单
+              //redis黑名单库中的键 ip:flowId
+              val blackListKey = PropertiesUtil.getStringByKey("cluster.key.anti_black_list", "jedisConfig.properties") + s"${antiBlackRecord._1}:${antiBlackRecordByFlow.flowId}"
+              //redis黑名单库中的值：flowScore|strategyCode|hitRules|time
+              val blackListValue = s"${antiBlackRecordByFlow.flowScore}|${antiBlackRecordByFlow.flowStrategyCode}|${antiBlackRecordByFlow.hitRules.mkString(",")}|${antiBlackRecordByFlow.hitTime}"
+              //更新黑名单库，超时时间为3600秒
+              jedis.setex(blackListKey, PropertiesUtil.getStringByKey("cluster.exptime.anti_black_list", "jedisConfig.properties").toInt, blackListValue)
+              //添加黑名单DataFrame-备份到ArrayBuffer
+              antiBlackListDFR.append(Row(((PropertiesUtil.getStringByKey("cluster.exptime.anti_black_list", "jedisConfig.properties").toLong) * 1000 + System.currentTimeMillis()).toString, blackListKey, blackListValue))
+            }
+          }
+        } catch {
+          case e: Exception =>
+            e.printStackTrace()
+        }
+      }
+    }
+
+    lines.foreachRDD(antiCalculateResult =>{
+      val date = new SimpleDateFormat("yyyy/MM/dd/HH").format(System.currentTimeMillis())
+      val yyyyMMddHH = date.replace("/","").toInt
+      val path: String = PropertiesUtil.getStringByKey("blackListPath","HDFSPathConfig.properties")+"itheima/"+yyyyMMddHH
+      try{
+        sc.textFile(path+"/part-00000").union(antiCalculateResult).repartition(1).saveAsTextFile(path)
+      }catch{
+        case e: Exception =>
+          antiCalculateResult.repartition(1).saveAsTextFile(path)
+      }    })
+
+        ssc
   }
 }

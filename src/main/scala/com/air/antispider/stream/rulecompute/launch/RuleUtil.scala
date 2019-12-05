@@ -3,17 +3,127 @@ package com.air.antispider.stream.rulecompute.launch
 
 import java.text.SimpleDateFormat
 import java.util
+import java.util.Date
 
 import com.air.antispider.stream.common.bean.{FlowCollocation, ProcessedData}
 import com.air.antispider.stream.rulecompute.businessprocess.{AntiCalculateResult, FlowScoreResult}
 import org.joda.time.DateTime
 
 import scala.collection.mutable
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 
 
 object RuleUtil {
 
-  def calculateFlowsScore(paramMap: mutable.Map[String, Int], FlowCollocations: Array[FlowCollocation]): Array[FlowScoreResult] = ???
+
+  def triggeredScore(scores: Array[Double], isTriggered: Array[Int]) = {
+    // 创建ArrayBuffer
+    val socreBuffer = new ArrayBuffer[Double]()
+    // 循环
+    for (i<- 0 until isTriggered.length){
+      // 判断是否触发当前规则
+      if(isTriggered(i) ==0){
+        socreBuffer += scores(i)
+      }
+    }
+    socreBuffer.toArray
+  }
+
+  def calculateFlowScore(
+                          result: Array[Array[Double]],
+                          isTriggered: Array[Int]): Double = {
+    //打分列表
+    val scores = result(1)
+    //总打分
+    val sum = scores.sum
+    //打分列表长度
+    val dim = scores.length
+    //系数1：平均分/10
+    val factor1 = sum / (10 * dim)
+    //命中数据库开放规则的score
+    val xa = triggeredScore(scores, isTriggered)
+    //命中规则中，规则分数最高的
+    val maxInXa = if (xa.isEmpty) {
+      0.0
+    } else {
+      xa.max
+    }
+    // 系数2：系数2的权重是60，指的是最高score以6为分界，
+    // 最高score大于6，就给满权重60，不足6，就给对应的maxInXa*10
+    val factor2 = if (1 < (1.0 / 6.0) * maxInXa) {
+      60
+    } else {
+      (1.0 / 6.0) * maxInXa * 60
+    }
+    //系数3：打开的规则总分占总规则总分的百分比，并且系数3的权重是40
+    val factor3 = 40 * (xa.sum / sum)
+    /**
+      * 系数2权重：60%，数据区间：10-60
+      * 系数3权重：40，数据区间：0-40
+      * 系数2+系数3区间为：10-100
+      * 系数1为:平均分/10
+      * 所以，factor1 * (factor2 + factor3)区间为:平均分--10倍平均分
+      */
+    factor1 * (factor2 + factor3)
+  }
+
+  def calculateFlowsScore(paramMap: scala.collection.mutable.Map[String, Int], flowList: Array[FlowCollocation]): Array[FlowScoreResult] = {
+    //封装最终打分结果：flowId、flowScore、flowLimitedScore、是否超过阈值、flowStrategyCode、命中规则列表、命中时间
+    val flowScores = new ArrayBuffer[FlowScoreResult]
+    //循环数据库查询出来的所有流程，进行匹配打分
+    for (flow <- flowList) {
+      //拿出当前流程的规则，就是我们web页面配置的那些阈值
+      val ruleList = flow.rules
+      //用来封装命中的规则的rileId
+      val hitRules = ListBuffer[String]()
+      //保存规则计算结果的二维数组（2行，n列），第一维是之前streaming计算统计的结果，第二维是针对对应统计结果的数据库打分结果
+      val result = Array.ofDim[Double](2,ruleList.size)
+      //根据每个流程对应的规则统计结果与预设的规则进行对比，若统计结果大于预设值，则对应的规则得分有效，否则，无效（即设为0）
+      var ruleIndex = 0
+      //规则是否触发，也就是web页面的复选框有没有被勾选
+      val isTriggered = new ArrayBuffer[Int]()
+      //循环数据库规则，循环结束，会将result填满，hitRules填满，isTriggered填满
+      for (rule <- ruleList) {
+        //规则状态放到这个数组
+        isTriggered += rule.ruleStatus
+        //规则名字
+        val ruleName = rule.ruleName
+        //通过规则名字去streaming统计的结果中找数值
+        val ruleValue = paramMap.getOrElse(ruleName, 0)
+        //把streaming统计结果封装到第0行，第ruleIndex列，后续ruleIndex会做+1操作
+        result(0)(ruleIndex) = ruleValue
+        //拿出数据库对应这个规则设置的阈值
+        val ruleValue1 = if ("accessPageIntervalLessThanDefault".equals(ruleName)) {
+          rule.ruleValue1
+        } else {
+          rule.ruleValue0
+        }
+        //数据库对应这个规则的打分
+        val ruleScore = rule.ruleScore
+        if (ruleValue > ruleValue1) {
+          //如果streaming统计结果超过了数据库阈值，将打分记录到result的第1行，第ruleIndex列，后续ruleIndex会做+1操作
+          result(1)(ruleIndex) = ruleScore
+          //规则命中，将规则信息添加到数组
+          hitRules.append(rule.ruleId)
+        } else {
+          //没命中，打分设置为0
+          result(1)(ruleIndex) = 0
+        }
+        //ruleIndex做+1操作，继续对比第二个rule规则
+        ruleIndex = ruleIndex + 1
+      }
+      //计算流程打分，打分区间为：平均分--10*平均分
+      val flowScore = calculateFlowScore(result, isTriggered.toArray)
+      val sdf: SimpleDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+      //命中时间
+      val hitTime = sdf.format(new Date())
+      //（流程Id，流程得分，流程阈值,是否大于阈值，strategyCode，命中规则id列表，命中时间）- 大于阈值定义为爬虫
+      flowScores.append(FlowScoreResult(flow.flowId, flowScore, flow.flowLimitScore,
+        flowScore > flow.flowLimitScore, flow.strategyCode, hitRules.toList,hitTime))
+    }
+    //将所有流程的结果信息返回
+    flowScores.toArray
+  }
 
   def calculateAntiResult(processedData: ProcessedData,
                           FlowCollocations: Array[FlowCollocation],
@@ -25,7 +135,7 @@ object RuleUtil {
                           criticalMinIntervalMap: scala.collection.Map[String, Int],
                           accessIntervalLessThanDefaultMap: scala.collection.Map[(String, String), Int],
                           differentTripQuerysMap: scala.collection.Map[String, Int],
-                          criticalCookiesMap: scala.collection.Map[String, Int],
+                          criticalCookiesMap: scala.collection.Map[String, Int]
                          ): AntiCalculateResult = {
     //当前处理这个ip的段
     val index = ip.indexOf(".")
@@ -125,6 +235,8 @@ object RuleUtil {
         val interval  = time2- time1
         intervalList.add(interval)
       }
+    }else{
+      intervalList.add(0)
     }
     intervalList
   }
@@ -136,6 +248,7 @@ object RuleUtil {
     val result = intervalLsit.toArray()
     util.Arrays.sort(result)
     result(0).toString.toInt
+
   }
 
 
