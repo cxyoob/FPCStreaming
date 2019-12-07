@@ -1,6 +1,6 @@
 package com.air.antispider.stream.common.util.spark
 
-import com.alibaba.fastjson.{JSON, JSONArray, JSONObject}
+import com.alibaba.fastjson.JSON
 
 /**
  * Spark监控数据获取工具类

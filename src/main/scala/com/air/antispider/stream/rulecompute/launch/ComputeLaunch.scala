@@ -8,7 +8,7 @@ import com.air.antispider.stream.common.util.hdfs.BlackListToRedis
 import com.air.antispider.stream.common.util.jedis.{JedisConnectionUtil, PropertiesUtil}
 import com.air.antispider.stream.common.util.kafka.KafkaOffsetUtil
 import com.air.antispider.stream.common.util.log4j.LoggerLevels
-import com.air.antispider.stream.dataprocess.businessprocess.AnalyzeRuleDB
+import com.air.antispider.stream.dataprocess.businessprocess.{AnalyzeRuleDB, SparkStreamingMonitor}
 import com.air.antispider.stream.rulecompute.businessprocess.{BroadcastProcess, FlowScoreResult}
 import kafka.message.MessageAndMetadata
 import kafka.serializer.StringDecoder
@@ -301,7 +301,9 @@ object ComputeLaunch {
       }catch{
         case e: Exception =>
           antiCalculateResult.repartition(1).saveAsTextFile(path)
-      }    })
+      }
+      SparkStreamingMonitor.queryMonitor(sc, antiCalculateResult)
+    })
 
         ssc
   }

@@ -27,9 +27,5 @@ object BlackListToHDFS {
     HdfsSaveUtil.save(dataFrame,null,path)
   }
 
-  def saveAntiOcpBlackList(): Unit ={
-
-
-  }
 
 }
